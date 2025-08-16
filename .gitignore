@@ -1,2 +1,6 @@
 # Ignore checkpoints directory (model checkpoints, large files)
 /checkpoints/
+
+# Python cache files
+__pycache__/
+*.py[cod]
