@@ -1,0 +1,2 @@
+# Ignore checkpoints directory (model checkpoints, large files)
+/checkpoints/
