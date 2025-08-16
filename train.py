@@ -9,7 +9,7 @@ Dataset: Jasper Ridge (L=198, K=4, H=W=100 assumed by provided loader)
 - 说明：本实现支持 `--backend mamba`（需 `pip install mamba-ssm`）与 `--backend like`（内置轻量近似）。若你已装 VSSM 也可按同形状替换。
 
 运行示例：
-    python jasper_dual_mamba_unmix.py \
+    python train.py \
         --dataset jasper \
         --data_dir ./data \
         --epochs 50 --batch_size 64 --patch 5 --stride 1 \
@@ -30,6 +30,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import os
+from plots import plot_abundance, plot_endmembers
 
 # ==== Optional real Mamba backend (install: pip install mamba-ssm) ====
 try:
@@ -258,11 +261,11 @@ class CrossFuse(nn.Module):
 
     def forward(self, zs: torch.Tensor, zp: torch.Tensor) -> torch.Tensor:
         # Early gate
-        zs = zs * self.gs(zp)
-        zp = zp * self.gp(zs)
+        zs1 = zs * self.gs(zp)
+        zp1 = zp * self.gp(zs)
         # Mid 双向
-        zs2 = self.ln_s(zs + self.mid_s(zp))
-        zp2 = self.ln_p(zp + self.mid_p(zs))
+        zs2 = self.ln_s(zs1 + self.mid_s(zp1))
+        zp2 = self.ln_p(zp1 + self.mid_p(zs1))
         # Late
         zf = torch.cat([zs2, zp2], dim=-1)
         return self.out(zf)
@@ -436,13 +439,154 @@ def train(args):
             print(f"Saved best checkpoint to {ckpt_path}")
 
     print("Training finished. Best SAD:", best_sad)
+    # ---- 在训练结束后，对整图进行推断并绘图 ----
+    try:
+        os.makedirs(os.path.join(args.out_dir, 'plots'), exist_ok=True)
+        ckpt_path = os.path.join(args.out_dir, f"best_{args.dataset}_dual_mamba.pth")
+        if os.path.exists(ckpt_path):
+            print(f"Loading best checkpoint from {ckpt_path} for full-image inference...")
+            ck = torch.load(ckpt_path, map_location='cpu')
+            model.load_state_dict(ck['model_state'])
+        else:
+            print("No checkpoint found, using current model weights for inference.")
+
+        # 使用 Data 的原始整图（Y: [N,L], A: [N,K]）来生成完整丰度图
+        data_obj = Data(dataset=args.dataset, device='cpu')
+        Y = data_obj.get('hs_img')  # [N,L]
+        A_true = data_obj.get('abd_map')  # [N,K]
+        L = data_obj.get_L()
+        K = data_obj.get_P()
+        col = data_obj.get_col()
+        H = W = col
+
+        model.to('cpu')
+        model.eval()
+
+        # 将整图分批推断（按像素中心patch），恢复为 HxWxK 的丰度图
+        patch = args.patch
+        r = patch // 2
+        # 重建立方体 [H,W,L]
+        cube = Y.view(H, W, L)
+        abd_spa_map = np.zeros((H, W, K), dtype=np.float32)
+        abd_spr_map = np.zeros((H, W, K), dtype=np.float32)
+        abd_fused_map = np.zeros((H, W, K), dtype=np.float32)
+
+        # 对每个像素提取 patch 并推断（会比较慢；可优化为批量）
+        pts = []
+        coords = []
+        for i in range(r, H - r):
+            for j in range(r, W - r):
+                p = cube[i - r:i + r + 1, j - r:j + r + 1, :].permute(2, 0, 1).unsqueeze(0)  # [1,L,p,p]
+                pts.append(p)
+                coords.append((i, j))
+
+        # 分批运行以节省显存
+        batch = 256
+        for s in range(0, len(pts), batch):
+            batch_pts = torch.cat(pts[s:s+batch], dim=0)  # [B,L,p,p]
+            with torch.no_grad():
+                out = model(batch_pts)
+            A_pred = out['A'].cpu().numpy()  # [B,K]
+            # 目前 model 的内部没有拆分 spa/spr 分支输出；我们只能使用 fused A
+            for idx, (ii, jj) in enumerate(coords[s:s+batch]):
+                abd_fused_map[ii, jj, :] = A_pred[idx]
+
+        # 保存真实和估计的丰度图（整图形式）以及端元估计
+        plots_dir = os.path.join(args.out_dir, 'plots')
+        np.save(os.path.join(plots_dir, 'abd_true.npy'), A_true.view(H, W, K).numpy())
+        np.save(os.path.join(plots_dir, 'abd_fused.npy'), abd_fused_map)
+
+        # 获取端元（E）并保存：解码器 E 是 model.dec.E0 + deltaE
+        E = model.dec.E0.detach().cpu().numpy() + model.dec.deltaE.detach().cpu().numpy()
+        # spa/spr 端元暂不可用（模型未暴露），用相同 E 填充占位
+        plot_abundance(A_true.view(H, W, K).numpy(), abd_fused_map, abd_fused_map, abd_fused_map, K, plots_dir)
+        # 为端元绘图准备输入：target M: [L,K] 或 [K,L]
+        M = data_obj.get('end_mem')
+        # 规范 M 维度到 [L,K]
+        M_np = M.numpy()
+        if M_np.shape[0] == K and M_np.shape[1] == L:
+            M_np = M_np.T
+        plot_endmembers(M_np, E.T if E.shape[0] == K and E.shape[1] == L else E, E, E, K, plots_dir)
+        print(f"Saved full-image plots to {plots_dir}")
+
+    # ---- 计算“真实”的指标：端元 SAD 与 丰度/重构 RMSE、重构 SAD ----
+        try:
+            import itertools
+            # 1) 端元 SAD（与真端元做最佳匹配，置换不变）
+            #   规范维度：E_hat: [K,L], M_true: [K,L]
+            E_hat = model.dec.E0.detach().cpu().numpy() + model.dec.deltaE.detach().cpu().numpy()  # [K,L]
+            M_true_np = data_obj.get('end_mem').numpy()  # [L,K] 或 [K,L]
+            if M_true_np.shape == (L, K):
+                M_true = M_true_np.T
+            elif M_true_np.shape == (K, L):
+                M_true = M_true_np
+            else:
+                raise ValueError(f"Unexpected end_mem shape: {M_true_np.shape}, expected (L,K) or (K,L)")
+
+            def sad_vec(u: np.ndarray, v: np.ndarray, eps: float = 1e-8) -> float:
+                u = u.astype(np.float64)
+                v = v.astype(np.float64)
+                un = u / (np.linalg.norm(u) + eps)
+                vn = v / (np.linalg.norm(v) + eps)
+                cos = np.clip((un * vn).sum(), -1.0, 1.0)
+                return float(np.arccos(cos))
+
+            # 计算 KxK 的 SAD 代价矩阵
+            cost = np.zeros((K, K), dtype=np.float64)
+            for i in range(K):
+                for j in range(K):
+                    cost[i, j] = sad_vec(E_hat[i], M_true[j])
+
+            # 对 K 较小（如 4-6），用遍历置换找最小总代价
+            best_perm, best_sum = None, float('inf')
+            for perm in itertools.permutations(range(K)):
+                s = sum(cost[i, perm[i]] for i in range(K))
+                if s < best_sum:
+                    best_sum = s
+                    best_perm = perm
+            sad_per_em = [cost[i, best_perm[i]] for i in range(K)]
+            sad_mean_rad = float(np.mean(sad_per_em))
+            sad_mean_deg = float(np.degrees(sad_mean_rad))
+
+            # 2) 丰度 RMSE（仅在有效中心区域上计算，以避免边缘未推断像素影响）
+            A_true_full = A_true.view(H, W, K).numpy()
+            mask = np.zeros((H, W), dtype=bool)
+            mask[r:H - r, r:W - r] = True
+            A_true_valid = A_true_full[mask]        # [N_valid, K]
+            A_pred_valid = abd_fused_map[mask]      # [N_valid, K]
+            abd_rmse = float(np.sqrt(np.mean((A_true_valid - A_pred_valid) ** 2)))
+
+            # 3) 重构谱 RMSE/SAD（真实整图中心像素区域）
+            cube_np = cube.numpy()                  # [H,W,L]
+            Y_true_valid = cube_np[mask]           # [N_valid, L]
+            Xhat_pred_valid = A_pred_valid @ E_hat # [N_valid, L]
+            recon_rmse = float(np.sqrt(np.mean((Y_true_valid - Xhat_pred_valid) ** 2)))
+            recon_sad_list = [sad_vec(Xhat_pred_valid[i], Y_true_valid[i]) for i in range(Y_true_valid.shape[0])]
+            recon_sad_mean_rad = float(np.mean(recon_sad_list))
+            recon_sad_mean_deg = float(np.degrees(recon_sad_mean_rad))
+
+            # 打印并保存
+            print(
+                f"=> True metrics: Recon RMSE={recon_rmse:.6f}, Recon SAD={recon_sad_mean_rad:.6f} rad ({recon_sad_mean_deg:.2f} deg); "
+                f"Abundance RMSE={abd_rmse:.6f}, Endmember SAD={sad_mean_rad:.6f} rad ({sad_mean_deg:.2f} deg)"
+            )
+            with open(os.path.join(plots_dir, 'metrics.txt'), 'w') as f:
+                f.write(f"Reconstruction RMSE: {recon_rmse:.6f}\n")
+                f.write(f"Reconstruction SAD (mean): {recon_sad_mean_rad:.6f} rad ({recon_sad_mean_deg:.2f} deg)\n")
+                f.write(f"Abundance RMSE: {abd_rmse:.6f}\n")
+                f.write(f"Endmember SAD (mean): {sad_mean_rad:.6f} rad ({sad_mean_deg:.2f} deg)\n")
+                f.write("Endmember SAD per pair (rad) in matched order: " + ", ".join(f"{x:.6f}" for x in sad_per_em) + "\n")
+        except Exception as me:
+            print("Metrics computation failed:", me)
+    except Exception as e:
+        print("Full-image plotting failed:", e)
 
 
 def build_args():
     p = argparse.ArgumentParser()
     # Backend: 'mamba' requires mamba-ssm; 'like' uses built-in lightweight blocks
     p.add_argument('--backend', type=str, choices=['like','mamba'], default='mamba' if HAS_MAMBA else 'like')
-    p.add_argument('--dataset', type=str, default='jasper')
+    p.add_argument('--dataset', type=str, choices=['samson','jasper','urban','apex','dc','moffett'], default='jasper')
     p.add_argument('--data_dir', type=str, default='./data')  # 与 Data 类保持一致的目录结构
     p.add_argument('--device', type=str, default='cuda:0')
     p.add_argument('--seed', type=int, default=1234)
