@@ -34,6 +34,16 @@ import numpy as np
 import os
 from plots import plot_abundance, plot_endmembers
 
+# tqdm progress bar (optional)
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except Exception:
+    HAS_TQDM = False
+    def tqdm(iterable=None, **kwargs):
+        # fallback: return the iterable unchanged for compatibility
+        return iterable if iterable is not None else []
+
 # ==== Optional real Mamba backend (install: pip install mamba-ssm) ====
 try:
     from mamba_ssm import Mamba as MambaLayer  # expects inputs [B, L, d]
@@ -388,7 +398,13 @@ def train(args):
     for epoch in range(1, args.epochs + 1):
         model.train()
         run_l1 = run_sad = run_sparse = 0.0
-        for step, (patch, y, _) in enumerate(train_loader, start=1):
+        # create an iterator and optionally wrap with tqdm for a progress bar
+        iterator = enumerate(train_loader, start=1)
+        if HAS_TQDM:
+            pbar = tqdm(iterator, total=len(train_loader), desc=f"Epoch {epoch}/{args.epochs}", unit="step")
+        else:
+            pbar = iterator
+        for step, (patch, y, _) in pbar:
             patch = patch.to(device)  # [B,L,p,p]
             y = y.to(device)          # [B,L]
 
@@ -416,8 +432,21 @@ def train(args):
             run_sparse += loss_sparse.item()
 
             if step % args.log_interval == 0:
-                print(f"[Epoch {epoch}/{args.epochs}] Step {step}/{len(train_loader)} | L1={run_l1/args.log_interval:.4f} SAD={run_sad/args.log_interval:.4f} Sparse={run_sparse/args.log_interval:.4f}")
+                avg_l1 = run_l1 / args.log_interval
+                avg_sad = run_sad / args.log_interval
+                avg_sparse = run_sparse / args.log_interval
+                if HAS_TQDM:
+                    # show averaged metrics on the progress bar
+                    pbar.set_postfix({"L1": f"{avg_l1:.4f}", "SAD": f"{avg_sad:.4f}", "Sparse": f"{avg_sparse:.4f}"})
+                else:
+                    # fallback: print as before
+                    print(f"[Epoch {epoch}/{args.epochs}] Step {step}/{len(train_loader)} | L1={avg_l1:.4f} SAD={avg_sad:.4f} Sparse={avg_sparse:.4f}")
                 run_l1 = run_sad = run_sparse = 0.0
+        if HAS_TQDM:
+            try:
+                pbar.close()
+            except Exception:
+                pass
 
         scheduler.step()
 
