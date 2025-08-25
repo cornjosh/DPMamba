@@ -75,6 +75,16 @@ def tensor_sad(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Ten
     return torch.acos(cos)
 
 
+def logdet_volume_loss(E: torch.Tensor, eps: float = 1e-3) -> torch.Tensor:
+    """Encourage endmember simplex spread without GT by maximizing volume.
+    We minimize -logdet(E E^T + eps I). E: [K,L].
+    """
+    K = E.size(0)
+    G = E @ E.t()
+    G = G + eps * torch.eye(K, dtype=E.dtype, device=E.device)
+    return -torch.logdet(G)
+
+
 def endmember_diversity_loss(E: torch.Tensor) -> torch.Tensor:
     """端元多样性：pairwise cos^2(Ek, Ej) 求和，E:[K, L]."""
     E = F.normalize(E, dim=-1)
@@ -282,10 +292,14 @@ class CrossFuse(nn.Module):
 
 
 class UnmixDecoder(nn.Module):
-    """丰度头（Softmax 单纯形） + 端元扰动 (E = E0 + ΔE)；输出 A, E, Xhat。"""
-    def __init__(self, d: int, K: int, L: int, E0: torch.Tensor | None = None):
+    """Abundance head (simplex via softmax) + endmember perturbation (E=E0+ΔE).
+    No GT is used; apply non-negativity to E and temperature on A.
+    """
+    def __init__(self, d: int, K: int, L: int, E0: torch.Tensor | None = None, tau: float = 1.0, nonneg_E: bool = True):
         super().__init__()
         self.K, self.L = K, L
+        self.tau = tau
+        self.nonneg_E = nonneg_E
         self.abun = nn.Sequential(
             nn.Linear(d, d), nn.GELU(), nn.Linear(d, K)
         )
@@ -296,7 +310,6 @@ class UnmixDecoder(nn.Module):
             with torch.no_grad():
                 E0 = E0.clone().float()
                 if E0.dim() == 2:
-                    # 期望形状 [K, L]
                     if E0.size(0) != K and E0.size(1) == K:
                         E0 = E0.t()
                 else:
@@ -305,15 +318,17 @@ class UnmixDecoder(nn.Module):
             self.deltaE = nn.Parameter(torch.zeros_like(self.E0))
 
     def forward(self, zf: torch.Tensor):
-        A = torch.softmax(self.abun(zf), dim=-1)  # [B,K]
-        E = self.E0 + self.deltaE                 # [K,L]
-        Xhat = A @ E                              # [B,L]
+        A = torch.softmax(self.abun(zf) / self.tau, dim=-1)  # [B,K]
+        E = self.E0 + self.deltaE                             # [K,L]
+        if self.nonneg_E:
+            E = F.softplus(E)                                 # 非负约束
+        Xhat = A @ E                                          # [B,L]
         return A, E, Xhat
 
 
 # ==== 6) 总网络 ====
 class DualBranchUnmixNet(nn.Module):
-    def __init__(self, L: int, K: int, d: int = 96, ls: int = 3, lp: int = 3, patch: int = 5, E0: torch.Tensor | None = None, backend: str = 'mamba'):
+    def __init__(self, L: int, K: int, d: int = 96, ls: int = 3, lp: int = 3, patch: int = 5, E0: torch.Tensor | None = None, backend: str = 'mamba', tau: float = 1.0):
         super().__init__()
         if backend == 'mamba' and HAS_MAMBA:
             self.spec = SpectralMambaReal(L=L, d=d, layers=ls)
@@ -324,7 +339,7 @@ class DualBranchUnmixNet(nn.Module):
             self.spec = SpectralMambaLike(L=L, d=d, layers=ls)
             self.spa  = SpatialMambaLike(L=L, d=d, layers=lp, patch=patch)
         self.fuse = CrossFuse(d=d)
-        self.dec  = UnmixDecoder(d=d, K=K, L=L, E0=E0)
+        self.dec  = UnmixDecoder(d=d, K=K, L=L, E0=E0, tau=tau, nonneg_E=True)
 
     def forward(self, patch: torch.Tensor, y_center: torch.Tensor | None = None):
         # patch: [B, L, p, p], y_center: [B, L] (可选，仅作为返回)
@@ -342,9 +357,13 @@ class DualBranchUnmixNet(nn.Module):
 def evaluate_epoch(model: nn.Module, loader: DataLoader, device: torch.device, max_batches: int = 50) -> Tuple[float, float]:
     model.eval()
     sad_list, rmse_list = [], []
-    for b, (patch, y, _) in enumerate(loader):
+    for b, batch in enumerate(loader):
         if b >= max_batches:
             break
+        if isinstance(batch, (list, tuple)) and len(batch) == 3:
+            patch, y, _ = batch
+        else:
+            patch, y = batch
         out = model(patch.to(device), y_center=y.to(device))
         Xhat = out["Xhat"]
         Y = out["Y"].to(device)
@@ -365,7 +384,7 @@ def train(args):
     K = data_obj.get_P()
     col = data_obj.get_col()  # H=W=col
 
-    # 端元初始化（使用 M1 作为 E0）
+    # 端元初始化（使用 M1 作为 E0；来自 Y 的预解混，不是 GT）
     E0 = data_obj.get("init_weight")  # [L,K] 或 [K,L] 取决于 .mat
     if isinstance(E0, torch.Tensor):
         E0_t = E0.clone().detach().to(device).float()
@@ -383,16 +402,13 @@ def train(args):
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
 
     # 模型
-    model = DualBranchUnmixNet(L=L, K=K, d=args.embed_dim, ls=args.ls, lp=args.lp, patch=args.patch, E0=E0_t, backend=args.backend).to(device)
+    model = DualBranchUnmixNet(L=L, K=K, d=args.embed_dim, ls=args.ls, lp=args.lp, patch=args.patch, E0=E0_t, backend=args.backend, tau=args.tau).to(device)
 
     # 优化器/调度器
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=args.epochs)
 
-    # 损失权重
-    lam_l1, lam_sad = args.lam_l1, args.lam_sad
-    lam_sparse, lam_div, lam_e = args.lam_sparse, args.lam_div, args.lam_e
-
+    # 损失权重 (using args directly now)
     best_sad = math.inf
 
     for epoch in range(1, args.epochs + 1):
@@ -404,7 +420,12 @@ def train(args):
             pbar = tqdm(iterator, total=len(train_loader), desc=f"Epoch {epoch}/{args.epochs}", unit="step")
         else:
             pbar = iterator
-        for step, (patch, y, _) in pbar:
+        for step, batch in pbar:
+            # 支持 (patch, y) 或 (patch, y, a_true)，训练阶段忽略 a_true
+            if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                patch, y, _ = batch
+            else:
+                patch, y = batch
             patch = patch.to(device)  # [B,L,p,p]
             y = y.to(device)          # [B,L]
 
@@ -418,10 +439,22 @@ def train(args):
             # 稀疏与端元多样性
             loss_sparse = l05_sparsity(A)
             loss_div = endmember_diversity_loss(E)
-            loss_e = (E - E.detach()).pow(2).mean() if E is out["E"] else torch.tensor(0.0, device=device)
+            loss_vol = logdet_volume_loss(E)
+            # 可选：若允许用 M1 作为来自 Y 的先验，可启用弱锚定（默认关闭）
+            loss_esam = 0.0
+            if args.lam_esam > 0.0 and hasattr(model.dec, "E0") and model.dec.E0 is not None:
+                Eh = F.normalize(E, dim=-1); Er = F.normalize(model.dec.E0, dim=-1)
+                cos = (Eh * Er).sum(dim=-1).clamp(-1.0, 1.0)
+                loss_esam = torch.acos(cos).mean()
 
-            loss = lam_l1 * loss_l1 + lam_sad * loss_sad + lam_sparse * loss_sparse + lam_div * loss_div + lam_e * loss_e
-
+            loss = (
+                args.lam_l1 * loss_l1 +
+                args.lam_sad * loss_sad +
+                args.lam_sparse * loss_sparse +
+                args.lam_div * loss_div +
+                args.lam_vol * loss_vol +
+                args.lam_esam * loss_esam
+            )
             optim.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -640,8 +673,10 @@ def build_args():
     p.add_argument('--lam_l1', type=float, default=1.0)
     p.add_argument('--lam_sad', type=float, default=0.5)
     p.add_argument('--lam_sparse', type=float, default=2e-4)
-    p.add_argument('--lam_div', type=float, default=1e-2)
-    p.add_argument('--lam_e', type=float, default=1e-3)
+    p.add_argument('--lam_div', type=float, default=1e-3)
+    p.add_argument('--lam_vol', type=float, default=5e-4)
+    p.add_argument('--tau', type=float, default=0.8)
+    p.add_argument('--lam_esam', type=float, default=0.0)  # optional weak anchor to M1 (off by default)
 
     # 评估与日志
     p.add_argument('--log_interval', type=int, default=50)
