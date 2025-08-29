@@ -1,0 +1,9 @@
+{
+  "trial_id": 3,
+  "params": {
+    "batch_size": 64,
+    "lr": 0.0001
+  },
+  "score": 0.05278222318738699,
+  "metric": "val_sad"
+}

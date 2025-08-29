@@ -1,0 +1,5 @@
+Reconstruction RMSE: 0.019342
+Reconstruction SAD (mean): 0.051532 rad (2.95 deg)
+Abundance RMSE: 0.156335
+Endmember SAD (mean): 0.258910 rad (14.83 deg)
+Endmember SAD per pair (rad) in matched order: 0.050033, 0.147679, 0.579019

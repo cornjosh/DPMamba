@@ -1,0 +1,14 @@
+{
+  "trial_id": 1,
+  "params": {
+    "batch_size": 32,
+    "embed_dim": 64,
+    "lam_l1": 0.5,
+    "lam_sad": 0.1,
+    "lp": 2,
+    "lr": 0.0001,
+    "ls": 2
+  },
+  "score": 0.05054712891578674,
+  "metric": "val_sad"
+}

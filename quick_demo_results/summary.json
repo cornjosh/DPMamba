@@ -1,0 +1,48 @@
+{
+  "total_trials": 4,
+  "best_score": 0.04766326583921909,
+  "best_params": {
+    "batch_size": 32,
+    "lr": 0.0002
+  },
+  "metric": "val_sad",
+  "direction": "minimize",
+  "all_results": [
+    {
+      "trial_id": 1,
+      "params": {
+        "batch_size": 32,
+        "lr": 0.0001
+      },
+      "score": 0.047998443618416785,
+      "metric": "val_sad"
+    },
+    {
+      "trial_id": 2,
+      "params": {
+        "batch_size": 32,
+        "lr": 0.0002
+      },
+      "score": 0.04766326583921909,
+      "metric": "val_sad"
+    },
+    {
+      "trial_id": 3,
+      "params": {
+        "batch_size": 64,
+        "lr": 0.0001
+      },
+      "score": 0.05278222318738699,
+      "metric": "val_sad"
+    },
+    {
+      "trial_id": 4,
+      "params": {
+        "batch_size": 64,
+        "lr": 0.0002
+      },
+      "score": 0.050535510294139385,
+      "metric": "val_sad"
+    }
+  ]
+}
