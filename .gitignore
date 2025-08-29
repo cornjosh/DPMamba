@@ -1,6 +1,10 @@
 # Ignore checkpoints directory (model checkpoints, large files)
 /checkpoints/
 
+# Hyperparameter optimization results
+/hyperopt_results/
+hyperopt_results_*/
+
 # Python cache files
 __pycache__/
 *.py[cod]

@@ -609,6 +609,9 @@ def train(args):
             print("Metrics computation failed:", me)
     except Exception as e:
         print("Full-image plotting failed:", e)
+    
+    # Return best validation score for hyperparameter optimization
+    return best_sad
 
 
 def build_args():
@@ -647,6 +650,22 @@ def build_args():
     p.add_argument('--log_interval', type=int, default=50)
     p.add_argument('--eval_batches', type=int, default=50)
     p.add_argument('--out_dir', type=str, default='./checkpoints')
+    
+    # 超参数优化
+    p.add_argument('--hyperopt', action='store_true', help='Enable hyperparameter optimization')
+    p.add_argument('--hyperopt_method', type=str, choices=['grid', 'bayes', 'optuna'], default='grid',
+                   help='Hyperparameter optimization method')
+    p.add_argument('--hyperopt_config', type=str, default='',
+                   help='Path to hyperparameter optimization config file')
+    p.add_argument('--hyperopt_trials', type=int, default=50,
+                   help='Number of trials for Bayesian optimization methods')
+    p.add_argument('--hyperopt_metric', type=str, default='val_sad',
+                   help='Metric to optimize (val_sad, val_rmse)')
+    p.add_argument('--hyperopt_direction', type=str, choices=['minimize', 'maximize'], default='minimize',
+                   help='Optimization direction')
+    p.add_argument('--hyperopt_results_dir', type=str, default='./hyperopt_results',
+                   help='Directory to save hyperparameter optimization results')
+    
     return p.parse_args()
 
 
