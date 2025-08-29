@@ -1,9 +1,0 @@
-{
-  "best_score": 0.04766326583921909,
-  "best_params": {
-    "batch_size": 32,
-    "lr": 0.0002
-  },
-  "metric": "val_sad",
-  "direction": "minimize"
-}

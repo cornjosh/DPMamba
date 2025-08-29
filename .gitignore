@@ -4,6 +4,9 @@
 # Hyperparameter optimization results
 /hyperopt_results/
 hyperopt_results_*/
+example_*_results/
+quick_demo_results/
+*_results/
 
 # Python cache files
 __pycache__/
