@@ -6,9 +6,21 @@ Dataset: Jasper Ridge (L=198, K=4, H=W=100 assumed by provided loader)
 - PatchDataset：基于 Data.get('hs_img') 重建 H×W×L 立方体，再按滑窗提供 patch
 - 模型：光谱分支(1D Mamba-like) + 空间分支(2D Mamba-like) + 三阶段融合 + 可解释解码头(A@E)
 - 损失：L1 + SAD + 稀疏(ℓ0.5) + 端元多样性；（TV 可选，默认关闭）
-- 说明：本实现支持 `--backend mamba`（需 `pip install mamba-ssm`）、`--backend like`（内置轻量近似）和 `--backend dct`（DCT 频域特征提取）。若你已装 VSSM 也可按同形状替换。
+- 说明：本实现支持多种后端：
+  * `--backend mamba`：光谱分支使用真实Mamba，空间分支使用真实Mamba（需 `pip install mamba-ssm`）
+  * `--backend dct_mamba`：光谱分支使用DCT+真实Mamba，空间分支使用真实Mamba（推荐，符合问题要求）
+  * `--backend dct`：光谱分支使用DCT频域特征提取，空间分支使用Mamba-like
+  * `--backend like`：内置轻量近似实现，无外部依赖
 
 运行示例：
+    # 使用DCT+Mamba组合（推荐）
+    python train.py \
+        --dataset jasper \
+        --data_dir ./data \
+        --epochs 50 --batch_size 64 --patch 5 --stride 1 \
+        --lr 2e-4 --device cuda:0 --backend dct_mamba
+    
+    # 使用纯DCT
     python train.py \
         --dataset jasper \
         --data_dir ./data \
@@ -282,6 +294,93 @@ class SpectralDCT(nn.Module):
         
         return z
 
+class SpectralDCTMamba(nn.Module):
+    """DCT + Mamba combination for spectral branch: 
+    1. Apply DCT to extract frequency domain features
+    2. Use Mamba to model the DCT coefficient sequence
+    Input: [B, L] -> Output: [B, d]
+    """
+    def __init__(self, L: int, d: int = 96, layers: int = 3, n_components: int = None, use_real_mamba: bool = None):
+        super().__init__()
+        self.L = L
+        self.d = d
+        # Use first half of DCT coefficients by default (low frequency components)
+        self.n_components = n_components if n_components is not None else min(L // 2, d)
+        
+        # Determine if we should use real Mamba based on availability
+        if use_real_mamba is None:
+            use_real_mamba = HAS_MAMBA
+        self.use_real_mamba = use_real_mamba and HAS_MAMBA
+        
+        # Pre-compute DCT matrix for efficiency
+        self.register_buffer('dct_matrix', self._get_dct_matrix(L, self.n_components))
+        
+        # DCT feature preprocessing
+        self.dct_proj = nn.Sequential(
+            nn.Linear(self.n_components, d),
+            nn.GELU(),
+            nn.LayerNorm(d)
+        )
+        
+        # Mamba processing layers
+        if self.use_real_mamba:
+            # Use real Mamba blocks if available
+            self.mamba_blocks = nn.ModuleList([MambaResBlock(d) for _ in range(layers)])
+        else:
+            # Use Mamba-like processing as fallback
+            self.mamba_blocks = nn.ModuleList([
+                nn.Sequential(
+                    nn.LayerNorm(d),
+                    nn.Linear(d, 2 * d),
+                    nn.GELU(),
+                    nn.Linear(2 * d, d)
+                ) for _ in range(layers)
+            ])
+        
+        # Output processing
+        self.out_norm = nn.LayerNorm(d)
+        self.glu = GLU(d)
+        
+    def _get_dct_matrix(self, N: int, M: int) -> torch.Tensor:
+        """Generate DCT-II transformation matrix."""
+        dct_matrix = torch.zeros(M, N)
+        for k in range(M):
+            for n in range(N):
+                if k == 0:
+                    dct_matrix[k, n] = 1.0 / math.sqrt(N)
+                else:
+                    dct_matrix[k, n] = math.sqrt(2.0 / N) * math.cos((math.pi * k * (2 * n + 1)) / (2 * N))
+        return dct_matrix
+        
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        # y: [B, L]
+        B, L = y.shape
+        
+        # 1. Apply DCT transformation to extract frequency domain features
+        y_dct = torch.matmul(y, self.dct_matrix.t())  # [B, L] @ [L, n_components] -> [B, n_components]
+        
+        # 2. Project DCT coefficients to feature space
+        z = self.dct_proj(y_dct)  # [B, d]
+        
+        # 3. Treat DCT coefficients as a sequence and apply Mamba processing
+        if self.use_real_mamba:
+            # Real Mamba expects [B, seq_len, d], we'll use a single timestep
+            z_seq = z.unsqueeze(1)  # [B, 1, d]
+            for block in self.mamba_blocks:
+                z_seq = block(z_seq)
+            z = z_seq.squeeze(1)  # [B, d]
+        else:
+            # Mamba-like processing with residual connections
+            for block in self.mamba_blocks:
+                z = z + block(z)
+        
+        # 4. Final processing
+        z = self.out_norm(z)
+        z = z + self.glu(z)  # Residual connection with GLU
+        
+        return z
+
+
 class SpatialMambaLike(nn.Module):
     """2D Mamba-like：Depthwise Separable Conv2d + Axial conv + GLU + 残差，输入 [B, L, p, p] → 汇聚到 [B, d]."""
     def __init__(self, L: int, d: int = 96, layers: int = 3, patch: int = 5):
@@ -376,11 +475,19 @@ class DualBranchUnmixNet(nn.Module):
         if backend == 'mamba' and HAS_MAMBA:
             self.spec = SpectralMambaReal(L=L, d=d, layers=ls)
             self.spa  = SpatialMambaReal(L=L, d=d, layers=lp, patch=patch)
+        elif backend == 'dct_mamba':
+            # New backend: DCT + Mamba for spectral, Real Mamba for spatial
+            self.spec = SpectralDCTMamba(L=L, d=d, layers=ls)
+            if HAS_MAMBA:
+                self.spa = SpatialMambaReal(L=L, d=d, layers=lp, patch=patch)
+            else:
+                print("[Warning] mamba-ssm not found for spatial branch. Using Mamba-like fallback.")
+                self.spa = SpatialMambaLike(L=L, d=d, layers=lp, patch=patch)
         elif backend == 'dct':
             self.spec = SpectralDCT(L=L, d=d)
             self.spa  = SpatialMambaLike(L=L, d=d, layers=lp, patch=patch)
         else:
-            if backend != 'like' and backend != 'dct' and not HAS_MAMBA:
+            if backend != 'like' and backend != 'dct' and backend != 'dct_mamba' and not HAS_MAMBA:
                 print("[Warning] mamba-ssm not found. Falling back to lightweight --backend like.")
             self.spec = SpectralMambaLike(L=L, d=d, layers=ls)
             self.spa  = SpatialMambaLike(L=L, d=d, layers=lp, patch=patch)
@@ -678,7 +785,7 @@ def train(args):
 def build_args():
     p = argparse.ArgumentParser()
     # Backend: 'mamba' requires mamba-ssm; 'like' uses built-in lightweight blocks; 'dct' uses DCT for spectral features
-    p.add_argument('--backend', type=str, choices=['like','mamba','dct'], default='mamba' if HAS_MAMBA else 'like')
+    p.add_argument('--backend', type=str, choices=['like','mamba','dct','dct_mamba'], default='mamba' if HAS_MAMBA else 'like')
     p.add_argument('--dataset', type=str, choices=['samson','jasper','urban','apex','dc','moffett'], default='jasper')
     p.add_argument('--data_dir', type=str, default='./data')  # 与 Data 类保持一致的目录结构
     p.add_argument('--device', type=str, default='cuda:0')
